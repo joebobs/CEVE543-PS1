@@ -1,0 +1,1032 @@
+---
+title: "CEVE 543 Fall 2025 Lab 4: Bayesian Rainfall Analysis"
+subtitle: "Iterative prior specification, Bayesian GEV workflow, Two-station comparison with ArviZ.jl"
+author: CEVE 543 Fall 2025
+date: "2025-09-19"
+type: "lab"
+module: 1
+week: 4
+objectives:
+  - "Set up Bayesian GEV models with informative priors"
+  - "Develop strategies for prior specification in extreme value analysis"
+  - "Compare rainfall patterns between two stations using Bayesian inference"
+ps_connection: "Builds Bayesian GEV toolkit for PS1 Tasks 1 and 3"
+
+engine: julia
+
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-block-bg: "#f8f8f8"
+    code-block-border-left: "#e1e4e5"
+    theme: simplex
+    number-sections: true
+    fig-format: svg
+    code-annotations: hover
+    echo: true  # Add this here too
+  typst:
+    fontsize: 11pt
+    margin:
+      x: 1in
+      y: 1in
+    number-sections: true
+    fig-format: svg
+    echo: true
+    code-annotations: false
+
+execute:
+  cache: false
+  freeze: auto
+  echo: true
+  warning: true
+  output: true
+  include: true  # Add this
+
+# Also add this at the top level
+echo: true
+output: true
+
+# Code formatting options
+code-overflow: wrap
+code-line-numbers: false
+code-block-font-size: "0.85em"
+---
+Load Packages
+```{julia}
+#| output: false
+using Pkg
+lab_dir = dirname(@__FILE__)
+Pkg.activate(lab_dir)
+# Pkg.instantiate() # uncomment this the first time you run the lab to install packages, then comment it back
+```
+
+```{julia}
+#| output: false
+using Turing
+using Extremes
+using ArviZ
+using Distributions
+using Random
+using NCDatasets
+using Optim
+```
+
+```{julia}
+#| output: false
+using CairoMakie
+CairoMakie.activate!(type="svg")
+```
+
+```{julia}
+#| output: false
+using Downloads
+using DataFrames
+ENV["DATAFRAMES_ROWS"] = 5
+using TidierData
+```
+
+Load utils
+
+```{julia}
+#| output: false
+include("util.jl")
+```
+
+Set random seed
+```{julia}
+#| output: false
+rng = MersenneTwister(543)
+```
+
+Load weather data
+```{julia}
+# | output: false
+stations, rainfall_data = let  # <1>
+    precip_fname = joinpath(lab_dir, "dur01d_ams_na14v11.txt")
+    url = "https://hdsc.nws.noaa.gov/pub/hdsc/data/tx/dur01d_ams_na14v11.txt"
+
+    if !isfile(precip_fname)
+        Downloads.download(url, precip_fname)
+    end
+    read_noaa_data(precip_fname)
+end
+```
+
+Find the coordinates of location to sample weather data from
+```{julia}
+#| output: false
+target_location = "Near Astrodome"  		 # <1>
+target_lon = -95.395303            # <2>
+target_lat = 29.6851832              # <3>
+```
+
+Calculate the distance of different stations from the chosen point
+
+```{julia}
+# Haversine formula for great circle distance with units
+function calc_distance(lon1, lat1, lon2, lat2)  # <1>
+	R = 6378.0u"km"  # <2>
+
+	# Convert degrees to radians
+	φ1 = deg2rad(lat1)  # <3>
+	φ2 = deg2rad(lat2)  # <4>
+	Δφ = deg2rad(lat2 - lat1)  # <5>
+	Δλ = deg2rad(lon2 - lon1)  # <6>
+
+	# Haversine formula
+	a = sin(Δφ / 2)^2 + cos(φ1) * cos(φ2) * sin(Δλ / 2)^2  # <7>
+	c = 2 * atan(sqrt(a), sqrt(1 - a))  # <8>
+
+	return R * c  # <9>
+end
+
+stations = @chain stations begin  # <10>
+	@mutate(distance_km = calc_distance(longitude, latitude, !!target_lon, !!target_lat))  # <11>
+	@arrange(distance_km)  # <12>
+end
+display(stations)
+```
+
+Check for stations that have data over a 100 years
+```{julia}
+@chain stations begin
+    @select(stnid, noaa_id, name, state, years_of_data, distance_km)
+    @filter(years_of_data > 100)
+end
+```
+
+Selected Pearland station
+```{julia}
+# REQUIRED: You MUST choose a different station than the default
+my_stnid = 668
+
+my_station = @chain stations begin
+	@filter(stnid == !!my_stnid)
+	first
+end
+
+# Extract rainfall data for your chosen station
+my_precip = @chain rainfall_data begin
+	@filter(stnid == !!my_stnid)  # <1>
+	@arrange(date)  # <2>
+end
+
+println("Selected station: $(my_station.noaa_id) - $(my_station.name)")
+println("Years of data: $(my_station.years_of_data)")
+```
+
+Remove missing records and remove inch string from rainfall data
+```{julia}
+# | output: false
+y = collect(skipmissing(ustrip.(u"inch", my_precip.rainfall)))  # <1>
+```
+
+Create a GEV model loaded with priors
+```{julia}
+# Define Bayesian GEV model
+@model function gev_model(y)
+	# Priors informed by data characteristics
+	μ ~ Normal(0, 10)           # <1>
+	log_σ ~ Normal(0, 10)       # <2>
+	ξ ~ Normal(0.0, 0.25)       # <3>
+
+	σ = exp(log_σ)              # <4>
+
+	y .~ GeneralizedExtremeValue(μ, σ, ξ) # <5>
+end
+```
+
+Fit turing MLE model
+```{julia}
+# Fit the model using MLE
+turing_fit = maximum_likelihood(gev_model(y), NelderMead(); initial_params = [0.0, 1.0, 0.0])  # <6>
+
+# Extract parameters
+μ_turing = turing_fit.values[:μ]           # <7>
+σ_turing = exp(turing_fit.values[:log_σ])  # <8>
+ξ_turing = turing_fit.values[:ξ]           # <9>
+
+# Display parameters in a DataFrame
+params_turing = DataFrame(
+	Parameter = ["Location (μ)", "Scale (σ)", "Shape (ξ)"],
+	Value = [round(μ_turing, digits = 3), round(σ_turing, digits = 3), round(ξ_turing, digits = 3)],
+)
+println("Turing.jl GEV parameters (MLE):")
+params_turing
+
+# Create distribution object
+turing_dist = GeneralizedExtremeValue(μ_turing, σ_turing, ξ_turing)  # <10>
+```
+
+Fit Extremes MLE model
+
+```{julia}
+
+# Fit GEV using maximum likelihood estimation (MLE)
+extremes_fit = gevfit(y)  # <2>
+
+# Extract parameters 
+μ_extremes = location(extremes_fit)[1]  # <3>
+σ_extremes = scale(extremes_fit)[1]     # <4>  
+ξ_extremes = shape(extremes_fit)[1]     # <5>
+
+# Display parameters in a DataFrame
+params_extremes = DataFrame(
+	Parameter = ["Location (μ)", "Scale (σ)", "Shape (ξ)"],
+	Value = [round(μ_extremes, digits = 3), round(σ_extremes, digits = 3), round(ξ_extremes, digits = 3)],
+)
+println("Extremes.jl GEV parameters:")
+params_extremes
+
+# Create distribution object for analysis
+extremes_dist = GeneralizedExtremeValue(μ_extremes, σ_extremes, ξ_extremes)  # <6>
+```
+
+Plot them together to compare them
+```{julia}
+function plot_gev_comparison(station_data, extremes_dist, turing_dist, station_info)
+    fig = Figure()
+    ax = Axis(fig[1, 1],
+        xlabel = "Return Period (years)",
+        ylabel = "Return Level (inches)",
+        title = "GEV Fit Comparison\n$(station_info.noaa_id): $(station_info.name)",
+        xscale = log10)  # <1>
+
+    # Plot theoretical curves
+    T_smooth = create_return_period_range(1.1, 250, 100)  # <2>
+
+    # Extremes.jl MLE curve
+    levels_extremes = [quantile(extremes_dist, 1 - 1 / T) for T in T_smooth]  # <3>
+    lines!(ax, T_smooth, levels_extremes, color = :blue, linewidth = 2, label = "Extremes MLE")
+
+    # Turing.jl curve  
+    levels_turing = [quantile(turing_dist, 1 - 1 / T) for T in T_smooth]  # <5>
+    lines!(ax, T_smooth, levels_turing, color = :red, linewidth = 2, linestyle = :dash, label = "Turing MLE")
+
+    # Empirical data points
+    emp_levels, emp_periods = weibull_plotting_positions(station_data.rainfall)  # <6>
+    scatter!(ax, emp_periods, emp_levels,
+        color = :black, markersize = 3, marker = :circle,
+        label = "Observed Data")
+
+    # Standard return periods
+    return_periods = [5, 10, 25, 50, 100, 250]
+    ax.xticks = return_periods  # <7>
+
+    axislegend(ax, position = :rb)  # <8>
+    return fig
+end
+
+plot_gev_comparison(my_precip, extremes_dist, turing_dist, my_station)
+```
+
+Re-initialize the gev model
+```{julia}
+#| output: false
+@model function gev_model(y)
+    μ ~ Normal(3.0, 1.0)
+    log_σ ~ Normal(1.0, 1.0)  # <1>
+    ξ ~ Normal(0.0, 0.3)
+    σ = exp(log_σ)  # <2>
+    dist = GeneralizedExtremeValue(μ, σ, ξ)
+    if length(y) > 0  # <3>
+        for i in eachindex(y)
+            y[i] ~ dist
+        end
+    end
+end
+```
+
+Sampling stategy for the MCMC process
+```{julia}
+#| warning: false
+#| output: false
+function load_or_sample(fname, model; overwrite=false, n_chains=4, samples_per_chain=2000, sampler=NUTS(), threading=MCMCThreads(), rng=rng)
+    idata = try
+        @assert !overwrite "Reading from cache disabled by overwrite=true"  # <1>
+        idata = ArviZ.from_netcdf(fname)
+        @info "Loaded cached prior samples from $fname"
+        return idata
+    catch
+        chains = sample(
+            model,
+            sampler,
+            threading,
+            Int(ceil(samples_per_chain * n_chains)),  # <2>
+            n_chains, # number of chains
+            verbose=false,
+        )
+        idata = ArviZ.from_mcmcchains(chains)
+        ArviZ.to_netcdf(idata, fname)
+        @info "Sampled and cached prior samples to $fname"
+        return idata
+    end
+end
+```
+
+Create prior for MCMC
+```{julia}
+#| output: false
+posterior_idata = let
+    fname = joinpath(lab_dir, "prior_v1.nc")
+    model = gev_model(y)  # <1>
+    overwrite = true # <2>
+    load_or_sample(fname, model; overwrite=overwrite)
+end
+posterior_GEVs = vec(GeneralizedExtremeValue.(posterior_idata.posterior.μ, exp.(posterior_idata.posterior.log_σ), posterior_idata.posterior.ξ))
+```
+
+<!-- ```{julia}
+let
+    fig = Figure(size=(1200, 600))
+    ax = Axis(fig[1, 1], xlabel="Return Period (years)", ylabel="Return Level (inches)",
+        title="Prior v1 Predictive Distribution", xscale=log10, xticks=[1, 2, 5, 10, 25, 50, 100, 250])
+    rts = logrange(1.1, 250, 500)
+    for i in rand(1:length(prior_GEVs_v1), 250)
+        gev = prior_GEVs_v1[i]
+        add_return_level_curve!(ax, gev, rts; color=(:blue, 0.125))
+    end
+    ylims!(ax, 0, 75)
+    fig
+end
+``` -->
+
+Confirm convergence
+```{julia}
+let
+    fig = Figure(size=(900, 500))
+    rts = logrange(1.1, 250, 500)
+    ax1 = Axis(fig[1, 1], xlabel="Return Period (years)", ylabel="Return Level (inches)",
+        title="Return Level Uncertainty: Prior vs Posterior", xscale=log10, xticks=[1, 2, 5, 10, 25, 50, 100, 250])
+    posterior_bands!(ax1, posterior_GEVs, rts; color=(:orange, 0.4), ci=0.90, label="Posterior 90% CI")
+    posterior_mean_curve!(ax1, posterior_GEVs, rts; color=:blue, linewidth=3, label="Posterior Mean")
+
+    mean_return_levels = [quantile(turing_dist, 1 - 1 / T) for T in rts]
+    lines!(ax1, rts, mean_return_levels, color=:red, linewidth=3, label="MLE")
+
+    axislegend(ax1; position=:lt)
+    fig
+end
+```
+
+The data has converged
+```{julia}
+ArviZ.summarize(posterior_idata)
+```
+
+50 year return period estimate
+```{julia}
+# 50-year return level distributions
+return_level_dist_fig = let
+	fig = Figure(size = (800, 400))
+
+	ax = Axis(fig[1, 1], xlabel = "50-year Return Level (inches)", ylabel = "Density",
+		title = "50-year Return Level Uncertainty")
+
+	# Calculate 50-year return levels
+	rl100_single = [quantile(gev, 0.49) for gev in posterior_GEVs]
+
+	hist!(ax, rl100_single, bins = 30, color = (:blue, 0.5), label = "Single-Station", normalization = :pdf)
+
+	axislegend(ax, position = :rt)
+
+	fig
+end
+```
+
+```{julia}
+# 100-year return level distributions
+return_level_dist_fig = let
+	fig = Figure(size = (800, 400))
+
+	ax = Axis(fig[1, 1], xlabel = "100-year Return Level (inches)", ylabel = "Density",
+		title = "100-year Return Level Uncertainty")
+
+	# Calculate 100-year return levels
+	rl100_single = [quantile(gev, 0.99) for gev in posterior_GEVs]
+
+	hist!(ax, rl100_single, bins = 30, color = (:blue, 0.5), label = "Single-Station", normalization = :pdf)
+
+	axislegend(ax, position = :rt)
+
+	fig
+end
+```
+
+Choosing other nearby stations
+```{julia}
+nearest_stations = find_nearest_stations(my_station, stations, 5)  # <1>
+
+target_lon = my_station.longitude
+target_lat = my_station.latitude
+nearest_with_distance = @chain nearest_stations begin
+	@mutate(distance_km = calc_distance(longitude, latitude, !!target_lon, !!target_lat)) # <2>
+	@select(stnid, name, distance_km, years_of_data)  # <3>
+end
+
+println("Nearest stations to $(my_station.noaa_id):")
+display(nearest_with_distance)
+```
+
+Run estimation for five nearby stations
+```{julia}
+# Container for return levels
+results = DataFrame(stnid = Int[],  station = String[], return50 = Float64[])
+
+for my_stnid in [668, 379, 598, 374, 683]
+    my_precip = @chain rainfall_data begin
+        @filter(stnid == !!my_stnid)  
+        @arrange(date)  
+    end
+
+    y = collect(skipmissing(ustrip.(u"inch", my_precip.rainfall)))
+
+    turing_fit = maximum_likelihood(
+        gev_model(y), 
+        NelderMead(); 
+        initial_params = [0.0, 1.0, 0.0]
+    )
+    μ, σ, ξ = turing_fit.values
+
+    T = 50
+    p = 1 - 1/T
+    return50 = μ + (σ/ξ) * ((-log(p))^(-ξ) - 1)
+
+    # Extract station name (first unique value)
+    station_names = @chain stations begin
+        @filter(stnid == !!my_stnid)   
+    end
+    station_name = unique(station_names.name)[1]
+
+    push!(results, (my_stnid, station_name, return50))
+end
+println(results)  # summary table
+
+
+```
+
+Now lets plot the data
+```{julia}
+station_ids = [668, 379, 598, 374, 683]
+colors = [:red, :blue, :green, :orange, :purple]  # one color per station
+
+fig = Figure()
+ax = Axis(fig[1, 1];
+          xlabel = "Date", 
+          ylabel = "Rainfall (inches)", 
+          title = "Rainfall Time Series Across Stations")
+
+for (i, my_stnid) in enumerate(station_ids)
+    clean_precip = @chain rainfall_data begin
+        @filter(stnid == !!my_stnid)
+        @arrange(date)
+        @filter(!ismissing(rainfall))
+    end
+
+    dates = clean_precip.date
+    y = ustrip.(u"inch", clean_precip.rainfall)
+
+    # Faint line
+    lines!(ax, dates, y, color = (colors[i], 1.0), linewidth = 2)
+
+    # Points on top
+    scatter!(ax, dates, y, color = colors[i], markersize = 6, label = "Station $my_stnid")
+end
+
+axislegend(ax, position = :rt)
+fig
+```
+Let us now fit a Mann-Kendall model
+
+```{julia}
+#| output: false
+function mann_kendall_test(x::AbstractVector)
+	"""Mann-Kendall test for monotonic trend detection."""
+	n = length(x)
+
+	# Test statistic: sum of signs of all pairwise differences
+	S = sum(sign(x[j] - x[i]) for i in 1:(n-1) for j in (i+1):n)
+
+	# For n>10, under Null Hypothesis of no trend,
+	# S is Normally distributed with mean 0 and
+	# variance V = (n/18) * (n-1) * (2n+5)
+	var_S = n * (n - 1) * (2n + 5) / 18
+
+	# Standardized test statistic with continuity correction
+	Z = if S > 0
+		(S - 1) / sqrt(var_S)
+	elseif S < 0
+		(S + 1) / sqrt(var_S)
+	else
+		0.0
+	end
+
+	# Two-tailed p-value
+	p_value = 2 * (1 - cdf(Normal(0, 1), abs(Z)))
+
+	return S, p_value
+end
+```
+
+Load CO2 data
+```{julia}
+#| output: false
+co2_data = let
+	co2_fname = joinpath(lab_dir, "logCo2.csv")
+	TidierFiles.read_csv(co2_fname) |> DataFrame
+end
+```
+
+Perform test for each station
+```{julia}
+station_ids = [668, 379, 598, 374, 683]
+results = DataFrame(stnid = Int[],  station = String[], test_statistic = Float64[], p_value = Float64[])
+
+for my_stnid in station_ids
+
+    my_rainfall = @chain rainfall_data begin
+	@filter(stnid == !!my_stnid)
+	@arrange(date)
+	@full_join(co2_data, "year")  # Join with CO2 data
+	@arrange(year)
+    end
+
+    my_rainfall_nomissing = @chain my_rainfall begin
+        @filter(!ismissing(rainfall) && !ismissing(log_CO2))
+    end
+
+    prcp_obs = collect(skipmissing(ustrip.(u"inch", my_rainfall_nomissing.rainfall)))
+
+    # Extract station name (first unique value)
+    station_names = @chain stations begin
+        @filter(stnid == !!my_stnid)   
+    end
+    station_name = unique(station_names.name)[1]
+
+    mk_S, mk_p = mann_kendall_test(prcp_obs)
+    push!(results, (my_stnid, station_name, mk_S, mk_p))
+end
+println(results)
+```
+
+First Non-Stationary Model
+```{julia}
+#| output: false
+@model function nonstationary_gev_model1(y, x)
+	# Model 1: μ(x) = α_μ + β_μ*x where x = log(CO2)
+	α_μ ~ Normal(3.0, 2.0)    # baseline location parameter
+	β_μ ~ Normal(0.0, 2.0)    # location trend parameter (inches per log(ppm))
+	log_σ ~ Normal(0.0, 1.0)  # log-scale parameter
+	ξ ~ Normal(0.0, 0.3)      # shape parameter
+
+	σ = exp(log_σ)
+
+	# Location parameter varies with CO2
+	for i in eachindex(y)
+		x_centered = x[i] - log(380)  # center around ~380 ppm
+		μ_x = α_μ + β_μ * x_centered
+		dist = GeneralizedExtremeValue(μ_x, σ, ξ)
+		y[i] ~ dist
+	end
+end
+```
+
+Second Non-Stationary model
+```{julia}
+@model function nonstationary_gev_model2(y, x)
+	# Model 2: μ(x) = α_μ + β_μ*x, σ(x) = α_σ + β_σ*x
+	α_μ ~ Normal(3.0, 2.0)      # baseline location parameter
+	β_μ ~ Normal(0.0, 2.0)      # location trend parameter
+	α_σ ~ LogNormal(0.0, 1.0)   # baseline scale parameter
+	β_σ ~ Normal(0.0, 0.2)      # scale trend parameter (small prior)
+	ξ ~ Normal(0.0, 0.3)        # shape parameter
+
+	for i in eachindex(y)
+		x_centered = x[i] - log(380)
+		μ_x = α_μ + β_μ * x_centered
+		σ_x = α_σ + β_σ * x_centered
+
+		# Ensure positive scale parameter
+		if σ_x > 0.1
+			dist = GeneralizedExtremeValue(μ_x, σ_x, ξ)
+			y[i] ~ dist
+		else
+			Turing.@addlogprob!(-Inf)
+		end
+	end
+end
+
+```
+
+Data collection
+```{julia}
+my_rainfall = @chain rainfall_data begin
+@filter(stnid == !!my_stnid)
+@arrange(date)
+@full_join(co2_data, "year")  # Join with CO2 data
+@arrange(year)
+end
+
+my_rainfall_nomissing = @chain my_rainfall begin
+    @filter(!ismissing(rainfall) && !ismissing(log_CO2))
+end
+```
+
+Lets fit the data now
+```{julia}
+#| output: false
+# Prepare data
+y_obs = ustrip.(u"inch", my_rainfall_nomissing.rainfall)
+x_obs = my_rainfall_nomissing.log_CO2  # x = log(CO2)
+# Fit the two models
+models = [
+	("Location trend", nonstationary_gev_model1(y_obs, x_obs)),
+	("Location + Scale trends", nonstationary_gev_model2(y_obs, x_obs)),
+]
+
+# Sample from posteriors and check diagnostics
+posterior_results = []
+for (name, model) in models
+	fname = joinpath(lab_dir, "nonstat_$(replace(name, " " => "_")).nc")
+	overwrite = false
+	idata = load_or_sample(fname, model; overwrite = overwrite, samples_per_chain = 1000)
+	push!(posterior_results, (name = name, idata = idata))
+
+	# Check diagnostics immediately after fitting
+	println("=== Diagnostics for $name ===")
+	display(ArviZ.summarize(idata))
+end
+```
+
+Extract the distributions from posteriors
+```{julia}
+#| output: false
+# Model 1: Location trend only
+function extract_model1_gevs(idata, x)
+	x_centered = x - log(380)  # center around ~380 ppm
+	α_μ = Array(idata.posterior[:α_μ])
+	β_μ = Array(idata.posterior[:β_μ])
+	σ = exp.(Array(idata.posterior[:log_σ]))
+	ξ = Array(idata.posterior[:ξ])
+	μ_x = α_μ .+ β_μ .* x_centered
+	vec(GeneralizedExtremeValue.(μ_x, σ, ξ))
+end
+
+# Model 2: Location + Scale trends
+function extract_model2_gevs(idata, x)
+	x_centered = x - log(380)
+	α_μ = Array(idata.posterior[:α_μ])
+	β_μ = Array(idata.posterior[:β_μ])
+	α_σ = Array(idata.posterior[:α_σ])
+	β_σ = Array(idata.posterior[:β_σ])
+	ξ = Array(idata.posterior[:ξ])
+	μ_x = α_μ .+ β_μ .* x_centered
+	σ_x = α_σ .+ β_σ .* x_centered
+	# Filter out negative scale parameters
+	valid = σ_x .> 0.1
+	vec(GeneralizedExtremeValue.(μ_x[valid], σ_x[valid], ξ[valid]))
+end
+```
+
+Extract GEV information
+```{julia}
+#| output: false
+# Extract data for each model
+model1_name, model1_idata = posterior_results[1].name, posterior_results[1].idata
+model2_name, model2_idata = posterior_results[2].name, posterior_results[2].idata
+
+# Approximate CO2 levels (x = log(CO2))
+x_1950 = co2_data.log_CO2[co2_data.year.==1950][1]  # ~310 ppm in 1950
+x_2025 = co2_data.log_CO2[co2_data.year.==2024][1]  # ~425 ppm projected for 2025
+
+# Extract GEV distributions for both time periods
+gevs_1950 = [
+	extract_model1_gevs(model1_idata, x_1950),
+	extract_model2_gevs(model2_idata, x_1950),
+]
+
+gevs_2025 = [
+	extract_model1_gevs(model1_idata, x_2025),
+	extract_model2_gevs(model2_idata, x_2025),
+]
+```
+
+Finding time variance in return periods
+```{julia}
+# Create comprehensive comparison: 1950 vs 2025 across both models
+fig_comprehensive = let
+	fig = Figure(size = (1000, 700))
+
+	rts = logrange(1.1, 250, 100)
+	xticks = [2, 5, 10, 25, 50, 100, 250]
+
+	# Top row: 1950 vs 2025 comparison for each model (adjust column widths)
+	ax1 = Axis(fig[1, 1], xlabel = "Return Period (years)", ylabel = "Return Level (inches)",
+		title = "Location Trend Model", xscale = log10, xticks = xticks)
+	ax2 = Axis(fig[1, 2], xlabel = "Return Period (years)", ylabel = "Return Level (inches)",
+		title = "Location + Scale Trends Model", xscale = log10, xticks = xticks)
+
+	# Make columns equal width
+	colsize!(fig.layout, 1, Relative(0.5))
+	colsize!(fig.layout, 2, Relative(0.5))
+
+	top_axes = [ax1, ax2]
+
+	for (i, (ax, gevs_50, gevs_25)) in enumerate(zip(top_axes, gevs_1950, gevs_2025))
+		posterior_bands!(ax, gevs_50, rts; ci = 0.90, color = (:blue, 0.3))
+		posterior_mean_curve!(ax, gevs_50, rts; color = :blue, linewidth = 2, label = "1950")
+		posterior_bands!(ax, gevs_25, rts; ci = 0.90, color = (:red, 0.3))
+		posterior_mean_curve!(ax, gevs_25, rts; color = :red, linewidth = 2, label = "2025")
+		if i == 1
+			axislegend(ax, position = :rb)
+		end
+	end
+    fig
+end
+```
+
+Data Preparation
+```{julia}
+#| output: false
+analysis_stnids = [668, 379, 598, 374, 683]
+# Prepare matrices for regional model
+y_matrix, x_vector = let
+	# Get rainfall matrix: [year, station]
+	rainfall_wide = @chain rainfall_data begin
+		@filter(in(stnid, !!analysis_stnids))
+		@mutate(rainfall_inch = ustrip(u"inch", rainfall))
+		@select(year, stnid, rainfall_inch)
+		@pivot_wider(names_from = stnid, values_from = rainfall_inch)
+		@arrange(year)
+	end
+
+	# Extract years and matrix
+	years = rainfall_wide.year
+	y_mat = Matrix(rainfall_wide[:, 2:end])  # Drop year column
+
+	# Get x vector (log CO2) for the same years
+	x_vec = @chain co2_data begin
+		@filter(in(year, !!years))
+		@arrange(year)
+		@select(log_CO2)
+	end
+
+	y_mat, x_vec.log_CO2
+end
+```
+
+Regional parameter selection
+```{julia}
+@model function regional_nonstationary_gev(y_matrix, x_vector)
+    n_years, n_stations = size(y_matrix)
+    # Regional parameters (shared across all stations)
+    β_region ~ Normal(0.0, 2.0)          # Regional trend (inches per log(ppm))
+    ξ_region ~ Normal(0.0, 0.2)          # Regional shape parameter
+    # Station-specific parameters (independent for each station)
+    α_μ_stations ~ MvNormal(fill(3.0, n_stations), I * 2.0)  # Baseline location for each station
+    log_σ_stations ~ MvNormal(zeros(n_stations), I * 0.5)    # Scale parameter for each station
+    σ_stations = exp.(log_σ_stations)
+    # Data likelihood - loop over matrix, skip missing values
+    for i in 1:n_years
+        x_centered = x_vector[i] - log(380)  # Center x around ~380 ppm CO2
+        for j in 1:n_stations
+            if !ismissing(y_matrix[i, j])
+                μ_ij = α_μ_stations[j] + β_region * x_centered
+                dist = GeneralizedExtremeValue(μ_ij, σ_stations[j], ξ_region)
+                y_matrix[i, j] ~ dist
+            end
+        end
+    end
+end
+# Fit regional model with diagnostics
+regional_idata = let
+    regional_fname = joinpath(lab_dir, "regional_nonstat.nc")
+    regional_model = regional_nonstationary_gev(y_matrix, x_vector)
+    overwrite = false
+    idata = load_or_sample(regional_fname, regional_model; overwrite = overwrite, samples_per_chain = 1500)
+    # Check diagnostics immediately after fitting
+    println("=== Regional Model Diagnostics ===")
+    display(ArviZ.summarize(idata))
+    idata
+end
+```
+
+Comparing single station and multi station for first station
+```{julia}
+# Extract regional model results for our primary station
+# Re-load necessary variables for proper scoping
+regional_fname = joinpath(lab_dir, "regional_nonstat.nc")
+regional_idata = ArviZ.from_netcdf(regional_fname)
+
+my_stnid = 668
+
+my_station_idx = findfirst(x -> x == my_stnid, analysis_stnids)
+regional_my_station = let
+	# Extract regional parameters (shared)
+	β_samples = vec(Array(regional_idata.posterior[:β_region]))
+	ξ_samples = vec(Array(regional_idata.posterior[:ξ_region]))
+
+	# Extract station-specific parameters for our station
+	α_μ_samples = vec(Array(regional_idata.posterior[:α_μ_stations])[:, :, my_station_idx])
+	σ_samples = exp.(vec(Array(regional_idata.posterior[:log_σ_stations])[:, :, my_station_idx]))
+
+	(α_μ = α_μ_samples, β_μ = β_samples, σ = σ_samples, ξ = ξ_samples)
+end
+
+# Extract single-station model results (Model 1: Location trend only)
+single_station = let
+	model1_idata = posterior_results[1].idata
+	α_μ_samples = vec(Array(model1_idata.posterior[:α_μ]))
+	β_μ_samples = vec(Array(model1_idata.posterior[:β_μ]))
+	σ_samples = exp.(vec(Array(model1_idata.posterior[:log_σ])))
+	ξ_samples = vec(Array(model1_idata.posterior[:ξ]))
+
+	(α_μ = α_μ_samples, β_μ = β_μ_samples, σ = σ_samples, ξ = ξ_samples)
+end
+
+# Prepare data for comparison plots
+rts = logrange(1.1, 250, 100)
+xticks = [2, 5, 10, 25, 50, 100, 250]
+x_2025 = co2_data.log_CO2[co2_data.year.==2024][1]
+x_centered = x_2025 - log(380)
+
+# Create GEV distributions for 2025
+μ_single_2025 = single_station.α_μ .+ single_station.β_μ .* x_centered
+gevs_single = GeneralizedExtremeValue.(μ_single_2025, single_station.σ, single_station.ξ)
+
+μ_regional_2025 = regional_my_station.α_μ .+ regional_my_station.β_μ .* x_centered
+gevs_regional = GeneralizedExtremeValue.(μ_regional_2025, regional_my_station.σ, regional_my_station.ξ)
+```
+
+Return Level curves
+```{julia}
+# Return level curves comparison
+return_level_fig = let
+	fig = Figure(size = (800, 500))
+
+	ax = Axis(fig[1, 1], xlabel = "Return Period (years)", ylabel = "Return Level (inches)",
+		title = "2025 Return Level Comparison: Single-Station vs Regional",
+		xscale = log10, xticks = xticks)
+
+	# Plot uncertainty bands and mean curves
+	posterior_bands!(ax, gevs_single, rts; ci = 0.90, color = (:blue, 0.3))
+	posterior_mean_curve!(ax, gevs_single, rts; color = :blue, linewidth = 3, label = "Single-Station")
+
+	posterior_bands!(ax, gevs_regional, rts; ci = 0.90, color = (:red, 0.3))
+	posterior_mean_curve!(ax, gevs_regional, rts; color = :red, linewidth = 3, label = "Regional")
+
+    # intercept line
+    lines!(ax, [50,50], [2,14], color=:black, linestyle=:dash, label="50 year return")
+
+	axislegend(ax, position = :rb)
+
+	fig
+end
+```
+
+Comparing single station and multi station for second station
+```{julia}
+# Extract regional model results for our primary station
+# Re-load necessary variables for proper scoping
+regional_fname = joinpath(lab_dir, "regional_nonstat.nc")
+regional_idata = ArviZ.from_netcdf(regional_fname)
+
+my_stnid = 379
+
+my_station_idx = findfirst(x -> x == my_stnid, analysis_stnids)
+regional_my_station = let
+	# Extract regional parameters (shared)
+	β_samples = vec(Array(regional_idata.posterior[:β_region]))
+	ξ_samples = vec(Array(regional_idata.posterior[:ξ_region]))
+
+	# Extract station-specific parameters for our station
+	α_μ_samples = vec(Array(regional_idata.posterior[:α_μ_stations])[:, :, my_station_idx])
+	σ_samples = exp.(vec(Array(regional_idata.posterior[:log_σ_stations])[:, :, my_station_idx]))
+
+	(α_μ = α_μ_samples, β_μ = β_samples, σ = σ_samples, ξ = ξ_samples)
+end
+
+# Extract single-station model results (Model 1: Location trend only)
+single_station = let
+	model1_idata = posterior_results[1].idata
+	α_μ_samples = vec(Array(model1_idata.posterior[:α_μ]))
+	β_μ_samples = vec(Array(model1_idata.posterior[:β_μ]))
+	σ_samples = exp.(vec(Array(model1_idata.posterior[:log_σ])))
+	ξ_samples = vec(Array(model1_idata.posterior[:ξ]))
+
+	(α_μ = α_μ_samples, β_μ = β_μ_samples, σ = σ_samples, ξ = ξ_samples)
+end
+
+# Prepare data for comparison plots
+rts = logrange(1.1, 250, 100)
+xticks = [2, 5, 10, 25, 50, 100, 250]
+x_2025 = co2_data.log_CO2[co2_data.year.==2024][1]
+x_centered = x_2025 - log(380)
+
+# Create GEV distributions for 2025
+μ_single_2025 = single_station.α_μ .+ single_station.β_μ .* x_centered
+gevs_single = GeneralizedExtremeValue.(μ_single_2025, single_station.σ, single_station.ξ)
+
+μ_regional_2025 = regional_my_station.α_μ .+ regional_my_station.β_μ .* x_centered
+gevs_regional = GeneralizedExtremeValue.(μ_regional_2025, regional_my_station.σ, regional_my_station.ξ)
+```
+
+Return Level curves
+```{julia}
+# Return level curves comparison
+return_level_fig = let
+	fig = Figure(size = (800, 500))
+
+	ax = Axis(fig[1, 1], xlabel = "Return Period (years)", ylabel = "Return Level (inches)",
+		title = "2025 Return Level Comparison: Single-Station vs Regional",
+		xscale = log10, xticks = xticks)
+
+	# Plot uncertainty bands and mean curves
+	posterior_bands!(ax, gevs_single, rts; ci = 0.90, color = (:blue, 0.3))
+	posterior_mean_curve!(ax, gevs_single, rts; color = :blue, linewidth = 3, label = "Single-Station")
+
+	posterior_bands!(ax, gevs_regional, rts; ci = 0.90, color = (:red, 0.3))
+	posterior_mean_curve!(ax, gevs_regional, rts; color = :red, linewidth = 3, label = "Regional")
+
+    # intercept line
+    lines!(ax, [50,50], [2,14], color=:black, linestyle=:dash, label="50 year return")
+
+	axislegend(ax, position = :rb)
+
+	fig
+end
+```
+
+Comparing single station and multi station for third station
+```{julia}
+# Extract regional model results for our primary station
+# Re-load necessary variables for proper scoping
+regional_fname = joinpath(lab_dir, "regional_nonstat.nc")
+regional_idata = ArviZ.from_netcdf(regional_fname)
+
+my_stnid = 683
+
+my_station_idx = findfirst(x -> x == my_stnid, analysis_stnids)
+regional_my_station = let
+	# Extract regional parameters (shared)
+	β_samples = vec(Array(regional_idata.posterior[:β_region]))
+	ξ_samples = vec(Array(regional_idata.posterior[:ξ_region]))
+
+	# Extract station-specific parameters for our station
+	α_μ_samples = vec(Array(regional_idata.posterior[:α_μ_stations])[:, :, my_station_idx])
+	σ_samples = exp.(vec(Array(regional_idata.posterior[:log_σ_stations])[:, :, my_station_idx]))
+
+	(α_μ = α_μ_samples, β_μ = β_samples, σ = σ_samples, ξ = ξ_samples)
+end
+
+# Extract single-station model results (Model 1: Location trend only)
+single_station = let
+	model1_idata = posterior_results[1].idata
+	α_μ_samples = vec(Array(model1_idata.posterior[:α_μ]))
+	β_μ_samples = vec(Array(model1_idata.posterior[:β_μ]))
+	σ_samples = exp.(vec(Array(model1_idata.posterior[:log_σ])))
+	ξ_samples = vec(Array(model1_idata.posterior[:ξ]))
+
+	(α_μ = α_μ_samples, β_μ = β_μ_samples, σ = σ_samples, ξ = ξ_samples)
+end
+
+# Prepare data for comparison plots
+rts = logrange(1.1, 250, 100)
+xticks = [2, 5, 10, 25, 50, 100, 250]
+x_2025 = co2_data.log_CO2[co2_data.year.==2024][1]
+x_centered = x_2025 - log(380)
+
+# Create GEV distributions for 2025
+μ_single_2025 = single_station.α_μ .+ single_station.β_μ .* x_centered
+gevs_single = GeneralizedExtremeValue.(μ_single_2025, single_station.σ, single_station.ξ)
+
+μ_regional_2025 = regional_my_station.α_μ .+ regional_my_station.β_μ .* x_centered
+gevs_regional = GeneralizedExtremeValue.(μ_regional_2025, regional_my_station.σ, regional_my_station.ξ)
+```
+
+Return Level curves
+```{julia}
+# Return level curves comparison
+return_level_fig = let
+	fig = Figure(size = (800, 500))
+
+	ax = Axis(fig[1, 1], xlabel = "Return Period (years)", ylabel = "Return Level (inches)",
+		title = "2025 Return Level Comparison: Single-Station vs Regional",
+		xscale = log10, xticks = xticks)
+
+	# Plot uncertainty bands and mean curves
+	posterior_bands!(ax, gevs_single, rts; ci = 0.90, color = (:blue, 0.3))
+	posterior_mean_curve!(ax, gevs_single, rts; color = :blue, linewidth = 3, label = "Single-Station")
+
+	posterior_bands!(ax, gevs_regional, rts; ci = 0.90, color = (:red, 0.3))
+	posterior_mean_curve!(ax, gevs_regional, rts; color = :red, linewidth = 3, label = "Regional")
+
+    # intercept line
+    lines!(ax, [50,50], [2,14], color=:black, linestyle=:dash, label="50 year return")
+
+	axislegend(ax, position = :rb)
+
+	fig
+end
+```
