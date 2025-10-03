@@ -1,16 +1,14 @@
 ---
-title: "CEVE 543 Fall 2025 Lab 4: Bayesian Rainfall Analysis"
-subtitle: "Iterative prior specification, Bayesian GEV workflow, Two-station comparison with ArviZ.jl"
+title: "Nonstationary Rainfall Frequency Analysis"
+subtitle: "Houston Daily Rainfall Extremes and Climate Change"
 author: CEVE 543 Fall 2025
-date: "2025-09-19"
+date: "2025-10-3"
 type: "lab"
 module: 1
 week: 4
 objectives:
-  - "Set up Bayesian GEV models with informative priors"
-  - "Develop strategies for prior specification in extreme value analysis"
-  - "Compare rainfall patterns between two stations using Bayesian inference"
-ps_connection: "Builds Bayesian GEV toolkit for PS1 Tasks 1 and 3"
+  - "Finish PS1"
+ps_connection: "Solves PS1"
 
 engine: julia
 
@@ -52,8 +50,8 @@ code-overflow: wrap
 code-line-numbers: false
 code-block-font-size: "0.85em"
 ---
-Load Packages
 ```{julia}
+#| input: false
 #| output: false
 using Pkg
 lab_dir = dirname(@__FILE__)
@@ -62,6 +60,7 @@ Pkg.activate(lab_dir)
 ```
 
 ```{julia}
+#| input: false
 #| output: false
 using Turing
 using Extremes
@@ -73,12 +72,14 @@ using Optim
 ```
 
 ```{julia}
+#| input: false
 #| output: false
 using CairoMakie
 CairoMakie.activate!(type="svg")
 ```
 
 ```{julia}
+#| input: false
 #| output: false
 using Downloads
 using DataFrames
@@ -89,16 +90,19 @@ using TidierData
 Load utils
 
 ```{julia}
+#| input: false
 #| output: false
 include("util.jl")
 ```
 
 Set random seed
 ```{julia}
+#| input: false
 #| output: false
 rng = MersenneTwister(543)
 ```
 
+## Stationary GEV Analysis
 Load weather data
 ```{julia}
 # | output: false
@@ -112,7 +116,7 @@ stations, rainfall_data = let  # <1>
     read_noaa_data(precip_fname)
 end
 ```
-
+### Select one Houston-area station for primary analysis throughout tasks 1, 3, 4
 Find the coordinates of location to sample weather data from
 ```{julia}
 #| output: false
@@ -121,6 +125,7 @@ target_lon = -95.395303            # <2>
 target_lat = 29.6851832              # <3>
 ```
 
+### Extract annual maximum daily precipitation from station data (provided) 
 Calculate the distance of different stations from the chosen point
 
 ```{julia}
@@ -156,7 +161,7 @@ Check for stations that have data over a 100 years
 end
 ```
 
-Selected Pearland station
+Selected Sugarland station
 ```{julia}
 # REQUIRED: You MUST choose a different station than the default
 my_stnid = 668
@@ -182,6 +187,7 @@ Remove missing records and remove inch string from rainfall data
 y = collect(skipmissing(ustrip.(u"inch", my_precip.rainfall)))  # <1>
 ```
 
+### Implement MLE using maximum_likelihood from Turing.jl (see Lab 3); benchmark results against Extremes.jl for validation
 Create a GEV model loaded with priors
 ```{julia}
 # Define Bayesian GEV model
@@ -281,12 +287,13 @@ end
 plot_gev_comparison(my_precip, extremes_dist, turing_dist, my_station)
 ```
 
+### Implement Bayesian GEV inference using MCMC with Turing.jl; specify and justify physically-informed priors for location, scale, and shape parameters based on Houston climate knowledge (see Lab 4 for multiple approaches - pick and justify one)
 Re-initialize the gev model
 ```{julia}
 #| output: false
 @model function gev_model(y)
-    μ ~ Normal(3.0, 1.0)
-    log_σ ~ Normal(1.0, 1.0)  # <1>
+    μ ~ Normal(3.0, 3)
+    log_σ ~ Normal(0, 1.0)  # <1>
     ξ ~ Normal(0.0, 0.3)
     σ = exp(log_σ)  # <2>
     dist = GeneralizedExtremeValue(μ, σ, ξ)
@@ -352,6 +359,7 @@ let
 end
 ``` -->
 
+### Compare posterior distributions to MLE results and ensure convergence (see Lab 4)
 Confirm convergence
 ```{julia}
 let
@@ -375,6 +383,7 @@ The data has converged
 ArviZ.summarize(posterior_idata)
 ```
 
+### Calculate and plot 50-year and 100-year return period estimates with posterior uncertainty bounds
 50 year return period estimate
 ```{julia}
 # 50-year return level distributions
@@ -413,7 +422,8 @@ return_level_dist_fig = let
 	fig
 end
 ```
-
+## Multi-station Regional Analysis
+### Repeat Task 1 for 4 additional Houston-area stations using identical methods
 Choosing other nearby stations
 ```{julia}
 nearest_stations = find_nearest_stations(my_station, stations, 5)  # <1>
@@ -429,6 +439,7 @@ println("Nearest stations to $(my_station.noaa_id):")
 display(nearest_with_distance)
 ```
 
+### Create summary table comparing 50-year return level estimates across stations
 Run estimation for five nearby stations
 ```{julia}
 # Container for return levels
@@ -466,6 +477,7 @@ println(results)  # summary table
 
 ```
 
+### Plot time series of all 5 stations on same axes to visualize synchronous behavior
 Now lets plot the data
 ```{julia}
 station_ids = [668, 379, 598, 374, 683]
@@ -497,6 +509,8 @@ end
 axislegend(ax, position = :rt)
 fig
 ```
+## Nonstationarity Analysis
+### Conduct Mann-Kendall trend test on annual maxima; report test statistic, p-value, and interpretation
 Let us now fit a Mann-Kendall model
 
 ```{julia}
@@ -538,6 +552,7 @@ co2_data = let
 end
 ```
 
+### Repeat nonstationarity analysis for all 5 stations and create summary table comparing trend test p-values
 Perform test for each station
 ```{julia}
 station_ids = [668, 379, 598, 374, 683]
@@ -570,6 +585,7 @@ end
 println(results)
 ```
 
+### Fit at least two nonstationary GEV models for your selected station
 First Non-Stationary Model
 ```{julia}
 #| output: false
@@ -635,7 +651,6 @@ end
 
 Lets fit the data now
 ```{julia}
-#| output: false
 # Prepare data
 y_obs = ustrip.(u"inch", my_rainfall_nomissing.rainfall)
 x_obs = my_rainfall_nomissing.log_CO2  # x = log(CO2)
@@ -659,6 +674,10 @@ for (name, model) in models
 end
 ```
 
+### Justify your choice of covariate(s) and which parameters vary with the covariate(s)
+*The covariate chosen was CO2 levels in the area. The intuition for that was because it is often found to be a proxy for large-scale climate and environmental changes. It also strongly correlates with global warming and hydrological cycles. Location (μ) and Scale (σ) are likely to vary with the covariate as location parameter represents the central tendancy of rainfall and an increasing CO2 can cause correspoding increase in rainfall. Scale parameter represents the spread of the extremes and the CO2 induced changes to the climate could contribute to that. The observation from the results here are that for the area selected, the affect of CO2 is not significant. (location and scale show covariate coefficients are not high and its confidence interval contains Zero)*
+
+### Generate return level plots showing how extreme events change over time under your models
 Extract the distributions from posteriors
 ```{julia}
 #| output: false
@@ -746,6 +765,8 @@ fig_comprehensive = let
 end
 ```
 
+## Regional Parameter Estimation
+### Choose and justify your regional model specification: which nonstationary GEV parameters should vary by station vs shared regionally
 Data Preparation
 ```{julia}
 #| output: false
@@ -775,7 +796,12 @@ y_matrix, x_vector = let
 	y_mat, x_vec.log_CO2
 end
 ```
+*The parameters that were chosen to be common across regional stations was shape and the covariate parameter for scale. This is because in the same region, while the effect of covariate may be similar (same covariate parameter), and the shape may be similar, the overall centrality (location) and the spread (scale) vary region to region based on minute changes in topology/climate related features of the area.*
 
+### Define and justify your choice of regional boundaries/stations to include based on geographic proximity, climate similarity, or other criteria
+*The 4 additional stations chosen were the closest stations to the original station (Sugarland) and are all within a 16km radius of it. This geographical proximity, while also being in the Gulf coast's subtropical climate, mean a similar exposure to storm events, atmospheric rivers and convective rainfall effects. The data length is also reasonable for the primary station > 100, and helps stabilize the regional analysis calculations for the other stations that do not have as many data points (>59)*
+
+### Implement your chosen regional model where some parameters are shared across stations while others remain station-specific
 Regional parameter selection
 ```{julia}
 @model function regional_nonstationary_gev(y_matrix, x_vector)
@@ -811,7 +837,7 @@ regional_idata = let
     idata
 end
 ```
-
+### Compare posterior uncertainty in 50-year return levels: single-station vs regional estimates for stations with different data lengths
 Comparing single station and multi station for first station
 ```{julia}
 # Extract regional model results for our primary station
@@ -1030,3 +1056,15 @@ return_level_fig = let
 	fig
 end
 ```
+
+## Communication
+Write exactly 2 paragraphs (150-200 words each) responding to this scenario: “A senior infrastructure engineer argues that 50 years of local data provides sufficient information for design and that climate models add unnecessary complexity and uncertainty.”
+Paragraph 1: Address uncertainty quantification - explain how Bayesian methods and regional parameter sharing actually reduce parameter uncertainty compared to single-station MLE
+Paragraph 2: Address model selection and risk - discuss evidence for nonstationarity and practical implications of underestimating future extreme events for infrastructure design
+Reference specific results from your model comparison, prior specification, and uncertainty analysis to make concrete technical arguments
+
+*While the 50 years of local data may seem adequate, the results above demonstrate that the Bayesian models significantly reduce the return period uncertainities using parameter sharing. The ability to use priors is also an exceptional utility as it allows the expert climate scientist to use information known about a region as prior information that the model can ground itself on. To support this, looking at the stations like 683 (THOMPSONS 3 WSW) with 59 data points shows that the regional estimation has significantly improved the uncertainity compared to the single stations estimation of return periods. The single-station Bayesian model had to estimate all parameters from one dataset alone, resulting in wider posteriors despite using Multi Chain Monte Carlo algorithms. The prior aware parameter sharing model isn't added complexity; it's more efficient use of available data and distributions, producing more precise parameter estimates and narrower uncertainty bounds for design values.
+
+Assuming of stationarity adds risk that may go unnoticed in traditional analyses. The Mann-Kendall tests across the five stations show mixed signals (p-values ranging 0.18-0.97), which hint at a "no clear trend" conclusion. However, the nonstationary models reveal important patterns: the location parameter trend with CO2 (β_μ = 0.29-0.32 inches per log(ppm)) indicates potential intensification, even if the uncertainity implies that it may not be statistically significant. Further, the 1950 vs 2025 return level comparison shows the posterior mean shifts slightly upward. Projects in infrastructure design that use stationary 50-year estimates would thus likely underestimate flood risk if these trends continue. Also, due to many such prohjects having lifespans often exceeding 50-100 years and replacement costs that are enormous, the "complexity" of nonstationarity modeling is actually mitigating risk.*
+
+
